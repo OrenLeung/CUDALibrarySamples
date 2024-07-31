@@ -108,6 +108,28 @@ struct cusparse_compute_type<int> {
 
 constexpr int EXIT_UNSUPPORTED = 2;
 
+float generateNormalRandom() {
+    static bool hasSpare = false;
+    static double spare;
+    
+    if (hasSpare) {
+        hasSpare = false;
+        return spare;
+    }
+
+    hasSpare = true;
+
+    double u, v, s;
+    do {
+        u = static_cast<double>(std::rand()) / RAND_MAX * 2.0 - 1.0;
+        v = static_cast<double>(std::rand()) / RAND_MAX * 2.0 - 1.0;
+        s = u * u + v * v;
+    } while (s >= 1.0 || s == 0.0);
+
+    s = std::sqrt(-2.0 * std::log(s) / s);
+    spare = v * s;
+    return u * s;
+}
 
 int run_fp16_gemm_sparse(cusparseLtHandle_t& handle, 
                           cusparseLtMatDescriptor_t& matA, 
@@ -122,7 +144,7 @@ int run_fp16_gemm_sparse(cusparseLtHandle_t& handle,
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&stop));
 
-    for (int i = 0; i < 20; ++i) {
+    for (int i = 0; i < 5000; ++i) {
         CHECK_CUDA(cudaEventRecord(start, 0));
 
         CHECK_CUSPARSE(cusparseLtMatmul(&handle, &plan, &alpha, dA_compressed, dB, &beta, dC, dD, d_workspace, nullptr, 0));
@@ -153,7 +175,7 @@ int run_fp16_gemm_dense(cublasHandle_t handle, int m, int n, int k, AB_t* dA, AB
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&stop));
 
-    for (int i = 0; i < 20; ++i) {
+    for (int i = 0; i < 5000; ++i) {
         CHECK_CUDA(cudaEventRecord(start, 0));
 
         CHECK_CUBLAS(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -238,14 +260,23 @@ int main(void) {
     auto     hB             = new AB_t[B_size / sizeof(AB_t)];
     auto     hC             = new C_t[C_size / sizeof(C_t)];
 
+    // for (int i = 0; i < m * k; i++) 
+    //     hA[i] = static_cast<AB_t>(static_cast<float>(std::rand() % 5 - 2)); // -2 ~ 2
+
+    // for (int i = 0; i < k * n; i++)
+    //     hB[i] = static_cast<AB_t>(static_cast<float>(std::rand() % 5 - 2));
+
+    // for (int i = 0; i < m * n; i++)
+    //     hC[i] = static_cast<C_t>(static_cast<float>(std::rand() % 5 - 2));
+
     for (int i = 0; i < m * k; i++) 
-        hA[i] = static_cast<AB_t>(static_cast<float>(std::rand() % 5 - 2)); // -2 ~ 2
+    hA[i] = static_cast<AB_t>(generateNormalRandom());
 
     for (int i = 0; i < k * n; i++)
-        hB[i] = static_cast<AB_t>(static_cast<float>(std::rand() % 5 - 2));
+        hB[i] = static_cast<AB_t>(generateNormalRandom());
 
     for (int i = 0; i < m * n; i++)
-        hC[i] = static_cast<C_t>(static_cast<float>(std::rand() % 5 - 2));
+        hC[i] = static_cast<C_t>(generateNormalRandom());
 
     float alpha = 1.0f;
     float beta  = 1.0f;
@@ -372,8 +403,8 @@ int main(void) {
     // Perform the matrix multiplication and benchmark
     run_fp16_gemm_sparse(handle, matA, matB, matC, plan, dA_compressed, dB, dC, dD, d_workspace, m, n, k, alpha, beta);
 
-    // time.sleep(5) to allow the GPU to cool down to prevent power & thermal throttling
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    // time.sleep(60) to allow the GPU to cool down to prevent power & thermal throttling
+    std::this_thread::sleep_for(std::chrono::seconds(60));
 
     // Initialize cuBLAS handle for dense GEMM
     cublasHandle_t cublas_handle;
