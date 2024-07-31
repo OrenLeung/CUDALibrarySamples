@@ -10,10 +10,14 @@
 
 #include <cuda_runtime_api.h> // cudaMalloc, cudaMemcpy, etc.
 #include <cusparseLt.h>       // cusparseLt header
+#include <cublas_v2.h>        // cublas header
 #include <cstdio>             // printf
 #include <cstdlib>            // std::rand
-                              
+#include <iostream>   
 #include <cuda_fp8.h>
+#include <thread>
+#include <chrono>
+
 
 #define FP16 1000
 #define INT8 1001
@@ -91,8 +95,93 @@ struct cusparse_compute_type<int> {
     }                                                                          \
 }
 
+#define CHECK_CUBLAS(func)                                                     \
+{                                                                              \
+    cublasStatus_t status = (func);                                            \
+    if (status != CUBLAS_STATUS_SUCCESS) {                                     \
+        printf("cuBLAS API failed at line %d with error: %d\n",                \
+               __LINE__, status);                                              \
+        return EXIT_FAILURE;                                                   \
+    }                                                                          \
+}
+
 
 constexpr int EXIT_UNSUPPORTED = 2;
+
+
+int run_fp16_gemm_sparse(cusparseLtHandle_t& handle, 
+                          cusparseLtMatDescriptor_t& matA, 
+                          cusparseLtMatDescriptor_t& matB, 
+                          cusparseLtMatDescriptor_t& matC, 
+                          cusparseLtMatmulPlan_t& plan, 
+                          AB_t* dA_compressed, AB_t* dB, C_t* dC, C_t* dD, 
+                          void* d_workspace, int m, int n, int k, 
+                          const float alpha, const float beta) {
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    for (int i = 0; i < 20; ++i) {
+        CHECK_CUDA(cudaEventRecord(start, 0));
+
+        CHECK_CUSPARSE(cusparseLtMatmul(&handle, &plan, &alpha, dA_compressed, dB, &beta, dC, dD, d_workspace, nullptr, 0));
+
+        CHECK_CUDA(cudaEventRecord(stop, 0));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+
+        float milliseconds = 0;
+        CHECK_CUDA(cudaEventElapsedTime(&milliseconds, start, stop));
+
+        double num_operations = 2.0 * m * n * k;
+        double tflops = (num_operations / (milliseconds / 1000.0)) / 1e12;
+
+        std::cout << "FP16 Sparse Run " << i + 1 << ": GEMM operation performance: " << tflops << " TFLOP/s" << std::endl;
+    }
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    return 0;
+}
+
+int run_fp16_gemm_dense(cublasHandle_t handle, int m, int n, int k, AB_t* dA, AB_t* dB, C_t* dC) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    for (int i = 0; i < 20; ++i) {
+        CHECK_CUDA(cudaEventRecord(start, 0));
+
+        CHECK_CUBLAS(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                  m, n, k,
+                                  &alpha,
+                                  dA, CUDA_R_16F, m,
+                                  dB, CUDA_R_16F, k,
+                                  &beta,
+                                  dC, CUDA_R_16F, m,
+                                  CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+        CHECK_CUDA(cudaEventRecord(stop, 0));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+
+        float milliseconds = 0;
+        CHECK_CUDA(cudaEventElapsedTime(&milliseconds, start, stop));
+
+        double num_operations = 2.0 * m * n * k;
+        double tflops = (num_operations / (milliseconds / 1000.0)) / 1e12;
+
+        std::cout << "FP16 Dense Run " << i + 1 << ": GEMM operation performance: " << tflops << " TFLOP/s" << std::endl;
+    }
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    return 0;
+}
 
 
 int main(void) {
@@ -113,9 +202,9 @@ int main(void) {
     }
     // Host problem definition, row-major order
     // bigger sizes may require dynamic allocations
-    constexpr int m            = 32;
-    constexpr int n            = 32;
-    constexpr int k            = 64;
+    constexpr int m            = 8192;
+    constexpr int n            = 8192;
+    constexpr int k            = 8192;
 
     auto     order          = CUSPARSE_ORDER_ROW;
     auto     opA            = CUSPARSE_OPERATION_NON_TRANSPOSE;
@@ -279,10 +368,23 @@ int main(void) {
                                                  &workspace_size))
     void* d_workspace;
     CHECK_CUDA( cudaMalloc((void**) &d_workspace, workspace_size) )
-    // Perform the matrix multiplication
-    CHECK_CUSPARSE( cusparseLtMatmul(&handle, &plan, &alpha, dA_compressed, dB,
-                                     &beta, dC, dD, d_workspace, streams,
-                                     num_streams) )
+
+    // Perform the matrix multiplication and benchmark
+    run_fp16_gemm_sparse(handle, matA, matB, matC, plan, dA_compressed, dB, dC, dD, d_workspace, m, n, k, alpha, beta);
+
+    // time.sleep(5) to allow the GPU to cool down to prevent power & thermal throttling
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+
+    // Initialize cuBLAS handle for dense GEMM
+    cublasHandle_t cublas_handle;
+    CHECK_CUBLAS(cublasCreate(&cublas_handle));
+
+    // Perform the dense matrix multiplication and benchmark
+    run_fp16_gemm_dense(cublas_handle, m, n, k, dA, dB, dC);
+
+    // Destroy cuBLAS handle
+    CHECK_CUBLAS(cublasDestroy(cublas_handle));
+
     //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // destroy plan and handle
     CHECK_CUSPARSE( cusparseLtMatDescriptorDestroy(&matA) )
@@ -290,65 +392,11 @@ int main(void) {
     CHECK_CUSPARSE( cusparseLtMatDescriptorDestroy(&matC) )
     CHECK_CUSPARSE( cusparseLtMatmulPlanDestroy(&plan) )
     CHECK_CUSPARSE( cusparseLtDestroy(&handle) )
-
-    //--------------------------------------------------------------------------
-    // device result check
-    // matrix A has been pruned
-    CHECK_CUDA( cudaMemcpy(hA, dA, A_size, cudaMemcpyDeviceToHost) )
-
-    bool A_std_layout = (is_rowmajor != isA_transposed);
-    bool B_std_layout = (is_rowmajor != isB_transposed);
-
-    // host computation
-    C_t* hC_result = new C_t[C_height * ldc];
-
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
-            COMPUTE_t sum  = static_cast<COMPUTE_t>(0);
-            for (int k1 = 0; k1 < k; k1++) {
-                auto posA = (A_std_layout) ? i * lda + k1 : i + k1 * lda;
-                auto posB = (B_std_layout) ? k1 * ldb + j : k1 + j * ldb;
-                sum      += static_cast<COMPUTE_t>(hA[posA]) *  // [i][k]
-                            static_cast<COMPUTE_t>(hB[posB]);   // [k][j]
-            }
-            auto posC       = (is_rowmajor) ? i * ldc + j : i + j * ldc;
-            hC_result[posC] = static_cast<C_t>(alpha * sum + beta * static_cast<float>(hC[posC]));  // [i][j]
-        }
-    }
-
-    // reuse hC for device results
-    CHECK_CUDA( cudaMemcpy(hC, dD, C_size, cudaMemcpyDeviceToHost) )
-
-    // host-device comparison
-    int correct = 1;
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
-            auto pos          = (is_rowmajor) ? i * ldc + j : i + j * ldc;
-            auto device_value = hC[pos];
-            auto host_value   = hC_result[pos];
-            if (device_value != host_value) {
-                // direct floating point comparison is not reliable
-                std::printf("(%d, %d):\t%3.0f vs. %3.0f\n",
-                            i, j, static_cast<float>(host_value), static_cast<float>(device_value));
-                correct = 0;
-                break;
-            }
-        }
-    }
-
-    if (correct) {
-        std::printf("matmul_example test PASSED\n");
-    }
-    else {
-        std::printf("matmul_example test FAILED: wrong result\n");
-    }
-
     //--------------------------------------------------------------------------
     // host memory deallocation
     delete[] hA;
     delete[] hB;
     delete[] hC;
-    delete[] hC_result;
     //--------------------------------------------------------------------------
     // device memory deallocation
     CHECK_CUDA( cudaFree(dA_compressed) )

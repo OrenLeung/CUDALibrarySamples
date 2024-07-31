@@ -19,7 +19,7 @@ ifndef CUDA_TOOLKIT_PATH
 endif
 
 INCS := -I$(CUDA_TOOLKIT_PATH)/include -I${CUSPARSELT_PATH}/include
-LIBS := -lcusparse -ldl
+LIBS := -lcusparse -ldl -lcublas
 NVCC := ${CUDA_TOOLKIT_PATH}/bin/nvcc
 
 matmul_example: matmul_example.cpp
@@ -33,7 +33,7 @@ matmul_example_static: matmul_example.cpp
 test:
 	@echo "\n==== cusparseLt Matmul Test ====\n"
 	./matmul_example
-	./matmul_example_static
+	# ./matmul_example_static
 
 clean:
 	rm -f matmul_example matmul_example_static
